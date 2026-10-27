@@ -1,0 +1,75 @@
+AUTOPILOT-RC KNOWLEDGE BASE (snapshot 2026-10-27, repo ~/Github/autopilot-rc, branch main, 1 commit 783828f "Initial Commit", owner Jaiganesh)
+
+== PURPOSE ==
+Self-driving miniature RC car. Pi on the car senses; the computer decides; the Arduino presses RC remote buttons. Python 3.9+, OpenCV contrib, numpy, pyserial, pygame. Hardware-free simulator included.
+GitHub description: "An RC car that drives itself. A Raspberry Pi streams camera and ultrasonic data, a neural network on the computer steers, Haar cascades spot stop signs and traffic lights, and an Arduino presses the remote's buttons. Comes with a simulator for testing without hardware."
+
+== ARCHITECTURE ==
+Pi (pi/) --Wi-Fi TCP--> Computer (autopilot_rc/) --USB serial 115200--> Arduino (arduino/rc_keyboard_control/) --pins--> RC remote --radio--> car.
+The Pi is the client and connects to the computer (the server). Start the computer side first.
+- Video: TCP 8000. Frames are [uint32 LE length][JPEG], 320x240 @10fps. Length 0 = end of stream.
+- Sensor: TCP 8002. One ASCII float (cm) per line, every 0.1 s. HC-SR04 trigger GPIO23, echo GPIO24 (BCM), voltage divider on echo (5V->3.3V), gpiozero max_distance 2 m.
+- Serial: 1 byte. 0 STOP, 1 FWD, 2 REV, 3 RIGHT, 4 LEFT, 6 FWD_RIGHT, 7 FWD_LEFT, 8 REV_RIGHT, 9 REV_LEFT (5 unused). Any other byte -> board replies "Invalid Command\n" and stops.
+- Arduino: pins 6 right, 7 left, 10 forward, 9 reverse, active LOW. Each loop reads <=1 byte, resets the pins, holds the command 50 ms (caps it at ~20 cmd/s; faster sending queues bytes and adds lag). The last command holds; no byte for 500 ms -> STOP. All computer scripts resend the command every frame/tick to satisfy that timeout.
+
+== DRIVER DECISION ORDER (autopilot_rc/driver.py Driver.decide) ==
+Detection + MLP run on every frame first, then:
+1. Ultrasonic <30 cm -> STOP (readings older than 1.0 s ignored).
+2. now < stop_until (stop-sign wait) -> STOP.
+3. Stop sign 0<d<25 cm and cooldown over -> STOP for 5 s, then ignore stop signs for 5 s more.
+4. Red light 0<d<30 cm -> STOP.
+5. MLP label: forward->FWD, left->FWD_LEFT, right->FWD_RIGHT, reverse/other->STOP.
+Messages are printed only when they change (say()). Press Q in the window to quit; RCSerial.close() sends STOP.
+
+== COMPONENTS ==
+- MLP (model.py): cv2.ml.ANN_MLP with layers [38400,32,4], SIGMOID_SYM, BACKPROP, weight scale 0.001, momentum 0, 500 iterations / eps 1e-4. Input = lower half of the grayscale frame (rows 120-239, ROI_TOP=120) flattened to float32. Labels: 0 left, 1 right, 2 forward, 3 reverse. predict = argmax.
+- Detection: Haar cascades models/cascades/stop_sign.xml and traffic_light.xml. detectMultiScale(scale 1.1, minNeighbors 5, minSize 30x30). Returns the box bottom row (y+h-5), or 0.
+- Traffic light state: GaussianBlur 25x25 on the grayscale ROI inset by 10px; lit if max-min > 150. The brightest spot's row in (1/8..4/8)*(h-30) = red, in (5.5/8..1)*(h-30) = green. Positional, not colour-based. Position and state both come from the LAST detected box.
+- Distance (DistanceToCamera): d = h / tan(alpha + atan((v - v0)/ay)), with h = 5.5 cm (15.5-10) for both signs and lights, alpha = CAMERA_ALPHA_DEG 8, v0 = 119.865631204, ay = 332.262498472 (from calibrate.py using a 9x6 chessboard and 20 photos in data/chess_board/).
+- SensorReader: background daemon thread server; never closes its socket.
+- common.py: deliberately does not import OpenCV (pygame and cv2 SDL clash on macOS). Holds RCSerial (port 'none' = print only; waits 2 s after opening for the Arduino reset), wait_for_stream, read_jpeg_frames, frame_to_sample, keys_to_command.
+- keys_to_command: up+right FWD_RIGHT/right, up+left FWD_LEFT/left, down+right REV_RIGHT/None, down+left REV_LEFT/None, up FWD/forward, down REV/reverse, right RIGHT/right, left LEFT/left, none STOP/None. A label of None is not recorded.
+- collect.py: pygame window; converts to grayscale with numpy using weights 0.299/0.587/0.114 to match OpenCV. Saves data/training/YYYYmmdd-HHMMSS.npz with train (uint8 Nx38400) and train_labels (float32 one-hot Nx4). Q/X quits. SAVE_FRAMES dumps JPEGs to data/frames/.
+- model.load_dataset also reads the old Python 2 float64 .npz format.
+- pi/stream_client.py: picamera2 (RGB888, 2 s settle) or any OpenCV source (webcam index, video, image sequence such as frame%02d.jpg). Paces to FRAMERATE, skips frames for faster files, optional loop, STREAM_SECONDS limit.
+
+== FILE MAP ==
+autopilot_rc/: config.py, common.py, driver.py, collect.py, control_test.py (arrow keys at 20 Hz), train.py (-> models/mlp.xml), evaluate.py (data/testing/), calibrate.py, model.py
+pi/: stream_client.py, ultrasonic_client.py
+arduino/rc_keyboard_control/rc_keyboard_control.ino
+models/cascades/*.xml (mlp.xml is gitignored and absent)
+data/: chess_board/ (20 jpgs), training/, testing/, frames/ (empty, .gitkeep)
+simulator/: fake_arduino.py (pty, mirrors the sketch rules, COMMAND_TIMEOUT 0.5, records history), fake_sensor.py (script "distance:seconds,..."), simulate.py (modes drive|collect|control; --camera --sensor --seconds 30 --headless --model --demo-model; default camera = chessboard frames, sensor "100:4,15:2,100:60"), render.py (ray-tracer, JSON config, writes <name>.mp4 + <name>_groundtruth.csv, deterministic, ~5 s per video-second, needs ffmpeg or imageio-ffmpeg), video_dataset.py (labels from heading turn rate, ±3 deg/s threshold over a ±0.2 s window; only moving frames; as_streamed = resize 320x240 + JPEG round-trip + gray), train_videos.py (adds mirrored frames, -> simulator/work/mlp_video.xml), evaluate_videos.py
+simulator/configs: train_base.json (straight_01, curve_left_01, curve_right_01, stop_sign_01, red_light_01, green_light_01, red_to_green_01, obstacle_01 -> videos/train), train_extra.json (9 curves incl. u-turn and s-bend, NEVER RENDERED), test.json (curve_left_tight_01, curve_right_tight_01, curve_left_wide_01, s_bend_01, stop_sign_then_curve_01 -> videos/test). Render camera: 640x480@30, height 0.15 m, pitch 12 deg, hfov 100 deg; track width 0.4 m; cruise 0.25 m/s.
+tests/: conftest (fake_arduino fixture, no_boot_delay), test_rc_common, test_serial, test_mlp, test_detection, test_driver_rules (stubs Driver via __new__), test_pipeline (real subprocesses over localhost), test_videos (marker "video"; needs >=95% train accuracy, >=90% on unseen test videos, compares turning time with ground truth).
+Gitignored: data/*/ contents, models/mlp.xml, simulator/videos/, simulator/work/, .venv.
+
+== CONFIG (env AUTOPILOT_RC_<NAME>, read at import time) ==
+SERVER_HOST 192.168.1.100 | BIND_HOST 0.0.0.0 | VIDEO_PORT 8000 | SENSOR_PORT 8002 | SERIAL_PORT /dev/tty.usbmodem1421 ('none' disables) | SERIAL_BAUD 115200 | CAMERA picamera2 | FRAMERATE 10 | STREAM_SECONDS 0 | CAMERA_LOOP 0 | SENSOR_TRIGGER_PIN 23 | SENSOR_ECHO_PIN 24 | SENSOR_INTERVAL 0.1 | SHOW_WINDOW 1 | MODEL_PATH models/mlp.xml | TRAINING_DATA_DIR | TESTING_DATA_DIR | SAVE_FRAMES 0 | CAMERA_ALPHA_DEG 8.0 | CAMERA_V0 | CAMERA_AY. FRAME 320x240 is fixed.
+Driver constants (not env): OBSTACLE 30, STOP_SIGN 25, TRAFFIC_LIGHT 30 cm; STOP_SIGN_WAIT 5 s, COOLDOWN 5 s; SENSOR_MAX_AGE 1 s.
+
+== COMMANDS ==
+Setup: python3 -m venv .venv; source .venv/bin/activate; pip install -r requirements-dev.txt. Must use opencv-contrib-python (cv2.ml, cascades). Pi: sudo apt install python3-picamera2 python3-gpiozero python3-lgpio.
+Real car: python -m autopilot_rc.control_test | python -m autopilot_rc.collect + (Pi) python3 -m pi.stream_client | python -m autopilot_rc.train | python -m autopilot_rc.evaluate | python -m autopilot_rc.driver + (Pi) pi.stream_client and pi.ultrasonic_client.
+Sim: python -m simulator.simulate drive [--headless] | python simulator/render.py simulator/configs/<cfg>.json --out simulator/videos/<train|test> [--only name] | python -m simulator.train_videos | python -m simulator.evaluate_videos.
+Tests: pytest (~2 min) | pytest -m "not video" (~35 s). The fake Arduino needs a pty, so it skips on Windows.
+
+== CURRENT STATE ==
+- Code complete (Python 3 / picamera2 / gpiozero port) with tests. No CI, no licence.
+- Missing: models/mlp.xml, all training/testing data, all rendered videos.
+- Tests NOT run on this machine: Anaconda Python 3.13 has no cv2. Create the venv first.
+- Pi hardware code and the Arduino sketch are untested by automation.
+- Known gap: the 100 deg render lens vs the ~51 deg real Pi lens makes signs and lights too small for the 30 px cascade minimum. test_stop_sign_detected_on_approach and test_red_light_detected_on_approach are xfail(strict=True); remove the markers once the lens is fixed (they will then XPASS and fail the run). Simulator-trained models are for the simulator only.
+
+== CAVEATS ==
+Detection runs even when the obstacle stop applies. The traffic light's position and state come from the last box. Light colour detection is positional on grayscale. The object height is hard-coded at 5.5 cm; re-calibrate if the mount changes. Arduino ~20 cmd/s cap. Keep collect's grayscale conversion in sync with the driver's. Env config must be set before Python starts.
+
+== NEXT STEPS ==
+1. Create the venv and get pytest -m "not video" green.
+2. Render train_base + test, then run the full pytest.
+3. Render train_extra, retrain, compare test accuracy.
+4. Set render hfov to ~51 deg, remove the xfails.
+5. On the car: re-calibrate, collect laps, train mlp.xml, tune thresholds.
+6. Add CI (Linux, not-video), a licence, and consistent box selection in detect_traffic_light.
+
+Related docs: README.md, simulator/README.md, ~/Project/Auto/autopilot-rc-HANDOFF.md.
